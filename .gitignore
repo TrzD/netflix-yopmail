@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Filelock runtime
+*.lock
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Gmail API OAuth secrets
+credentials.json
+token.json
+
+# Temp review / debug files
+r4_chat*.b64
+r5_s*.txt
+round4_chat*.txt
+chrome_debug.bat
+
+# OAuth + IMAP test helpers (kept locally, not in repo)
+auth_gmail.py
+oauth_server.py
+test_imap.py
+test_api.py
+test_recaptcha.py
+test_rss.py
+credentials.json
+token.json
+_test_*.py

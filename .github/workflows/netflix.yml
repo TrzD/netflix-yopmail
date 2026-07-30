@@ -1,0 +1,59 @@
+name: Netflix Auto-Verify
+
+on:
+  schedule:
+    # 3 lần/ngày, mỗi lần chạy loop 6 tiếng
+    # GMT+7: 06:00, 12:00, 18:00 → UTC: 23:00, 05:00, 11:00
+    - cron: "0 23,5,11 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours — killed by runner when time's up
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-v1
+
+      - name: Install dependencies
+        run: pip install playwright filelock
+
+      - name: Install Playwright Chromium
+        run: playwright install chromium --with-deps
+
+      - name: Polling loop — scan every ~30s for 6 hours
+        env:
+          YOPMAIL_ID: ${{ secrets.YOPMAIL_ID }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          SCAN=0
+          while true; do
+            echo "=== SCAN #$SCAN $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+            python main.py --ci || true
+            SCAN=$((SCAN + 1))
+
+            # Push state file về repo mỗi ~20 scan (~10 phút) để không mất dữ liệu
+            if [ $((SCAN % 20)) -eq 0 ]; then
+              git add last_processed.txt 2>/dev/null || true
+              if ! git diff --cached --quiet 2>/dev/null; then
+                git commit -m "🔄 state update — scan #$SCAN [auto]" && git push || true
+              fi
+            fi
+
+            sleep 30
+          done
