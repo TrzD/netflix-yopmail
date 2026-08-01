@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Yopmail → Netflix Verify automation (v12 — Round 5 Claude Opus fixes).
+Yopmail → Netflix Verify automation (v17 — ok:True bug fix + selector fix).
 
-Tự động kiểm tra inbox Yopmail, duyệt tối đa 5 email gần nhất,
-tìm link Netflix (travel verify + update household), auto-confirm nếu có nút,
-và truy cập để Netflix ghi nhận.
+Tự động kiểm tra inbox Gmail (label Netflix-yopmail qua IMAP), duyệt tối đa
+5 email gần nhất, tìm link Netflix (travel verify + update household),
+auto-confirm nếu có nút, và truy cập để Netflix ghi nhận.
 
 Cải tiến v8 (Round 3 — Chat 3 + Chat 4):
 - extract_links_from_current_email: dedup links, log errors explicitly,
@@ -54,17 +54,32 @@ Cải tiến v12 (Round 5 — Chat 14-16 Claude Opus fixes):
 - confirm_page: filter(visible=True) before .first (hidden element edge case)
 - Page leak fix: close orphaned pages on asyncio.TimeoutError from new_page()
 - is_link_expired: count() fast path instead of always waiting 3s
-- NETFLIX_HREF_SELECTOR: add # fragment variants
 - Async FileLock wrappers via asyncio.to_thread (no event loop blocking)
 - atomic_write: track f_closed flag to prevent double-close of raw_fd
 - _CONFIRM_LABEL: word-boundary anchors (^...$) to prevent partial matches
 - save_processed before in-memory state change (persistence-first order)
 - Dead code cleanup: collapse PWTimeout/Exception catch branches, remove unused bindings
 
+Cải tiến v17 (fix sau review):
+- FIX QUAN TRỌNG: confirm_netflix_page giờ trả status string thay vì bool.
+  Trước đây "không tìm thấy nút" luôn bị coi là ok=True → token bị mark
+  "done" vĩnh viễn dù chưa từng xác nhận thật (có thể do bị chặn/challenge,
+  đổi layout, hoặc render chậm). Giờ chỉ ok=True khi (a) click thành công +
+  URL đổi, hoặc (b) đã rời khỏi verify/update-location path (Netflix tự
+  xác nhận qua GET). Nếu vẫn còn ở verify path mà không thấy nút →
+  "uncertain", KHÔNG set done, để lần poll sau retry.
+- _CONFIRM_LABEL: mở rộng "Yes, this is me" → chấp nhận cả "is"/"was"
+  (README mô tả nút là "was", code cũ chỉ match "is" — lệch nhau).
+- Xoá NETFLIX_HREF_SELECTOR (dead code, tàn dư bản Yopmail-scrape cũ,
+  không còn được dùng ở đâu sau khi migrate sang IMAP).
+- Timezone/locale của browser context đọc từ env NETFLIX_TIMEZONE /
+  NETFLIX_LOCALE (mặc định giữ nguyên America/New_York / en-US để không
+  đổi hành vi cũ nếu không set) — nên set theo múi giờ thật của tài khoản
+  nếu biết, để giảm lệch tín hiệu so với hoạt động thường ngày.
+
 State file: TOKEN\tSTATUS format, mark_in_progress claim (exactly-once)
 filelock + atomic_write + _fsync_dir (crash-durability)
 """
-
 from __future__ import annotations
 
 import argparse
@@ -93,21 +108,23 @@ GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 if not GMAIL_USER or not GMAIL_APP_PASSWORD:
     sys.exit("❌ Thiếu biến môi trường YOPMAIL_ID hoặc GMAIL_APP_PASSWORD.")
 
-NETFLIX_HREF_SELECTOR = (
-    "a[href^='https://www.netflix.com/account/travel/verify?'], "
-    "a[href^='https://www.netflix.com/account/travel/verify#'], "
-    "a[href^='https://www.netflix.com/account/update-primary-location?'], "
-    "a[href^='https://www.netflix.com/account/update-primary-location#']"
-)
-
 STATE_FILE = Path("last_processed.txt")
 NAV_TIMEOUT_MS = 30_000
 MAX_EMAILS = 5
 RETRY_COUNT = 2
 RETRY_DELAY = 1.0
 MAX_CONCURRENCY = 5  # Số tab xử lý song song tối đa
-
 LOCK_TIMEOUT = 10  # seconds
+
+# v17: cho phép override timezone/locale qua env — mặc định giữ nguyên giá
+# trị cũ để không đổi hành vi nếu không set.
+BROWSER_TIMEZONE = os.environ.get("NETFLIX_TIMEZONE", "America/New_York")
+BROWSER_LOCALE = os.environ.get("NETFLIX_LOCALE", "en-US")
+
+# Verify/update-location path markers — dùng để phân biệt "vẫn còn ở trang
+# xác nhận" (uncertain nếu không thấy nút) vs "đã bị Netflix redirect đi nơi
+# khác" (resolved, có thể tự xác nhận qua GET không cần nút).
+VERIFY_PATH_MARKERS = ("/account/travel/verify", "/account/update-primary-location")
 
 # State file format: TOKEN\tSTATUS (tab-separated)
 # STATUS: "in_progress" hoặc "done"
@@ -145,30 +162,29 @@ Object.defineProperty(navigator,'plugins',{
 Object.defineProperty(navigator,'hardwareConcurrency',{get:()=>4});
 window.chrome={runtime:{connect:()=>({onDisconnect:{addListener:()=>{}},onMessage:{addListener:()=>{}},postMessage:()=>{},disconnect:()=>{}}),onConnect:{addListener:()=>{}},onMessage:{addListener:()=>{}}},app:{isInstalled:false,InstallState:{DISABLED:'disabled',INSTALLED:'installed',NOT_INSTALLED:'not_installed'},RunningState:{CANNOT_RUN:'cannot_run',READY_TO_RUN:'ready_to_run',RUNNING:'running'}},csi:()=>({startE:0,onloadT:0,pageT:0,tran:0}),loadTimes:()=>({requestTime:0,startLoadTime:0,commitLoadTime:0,finishDocumentLoadTime:0,finishLoadTime:0,firstPaintTime:0,firstPaintAfterLoadTime:0,navigationType:'Other',wasFetchedViaSpdy:false,wasNpnNegotiated:false,npnNegotiatedProtocol:'unknown',wasAlternateProtocolAvailable:false,connectionInfo:''})};
 try{
- const _q=navigator.permissions.query;
- navigator.permissions.query=(p)=>p.name==='notifications'
-  ?Promise.resolve({state:Notification.permission}):_q.call(navigator.permissions, p);
+  const _q=navigator.permissions.query;
+  navigator.permissions.query=(p)=>p.name==='notifications'
+    ?Promise.resolve({state:Notification.permission}):_q.call(navigator.permissions, p);
 }catch(e){}
 try{
- const _gp=WebGLRenderingContext.prototype.getParameter;
- WebGLRenderingContext.prototype.getParameter=function(p){
-  if(p===37445)return 'Intel Inc.';
-  if(p===37446)return 'Intel Iris OpenGL';
-  return _gp.apply(this,[p]);
- };
-}catch(e){}
-try{
- if(typeof WebGL2RenderingContext!=='undefined'){
-  const _gp2=WebGL2RenderingContext.prototype.getParameter;
-  WebGL2RenderingContext.prototype.getParameter=function(p){
-   if(p===37445)return 'Intel Inc.';
-   if(p===37446)return 'Intel Iris OpenGL';
-   return _gp2.apply(this,[p]);
+  const _gp=WebGLRenderingContext.prototype.getParameter;
+  WebGLRenderingContext.prototype.getParameter=function(p){
+    if(p===37445)return 'Intel Inc.';
+    if(p===37446)return 'Intel Iris OpenGL';
+    return _gp.apply(this,[p]);
   };
- }
+}catch(e){}
+try{
+  if(typeof WebGL2RenderingContext!=='undefined'){
+    const _gp2=WebGL2RenderingContext.prototype.getParameter;
+    WebGL2RenderingContext.prototype.getParameter=function(p){
+      if(p===37445)return 'Intel Inc.';
+      if(p===37446)return 'Intel Iris OpenGL';
+      return _gp2.apply(this,[p]);
+    };
+  }
 }catch(e){}
 """
-
 # -----------------------------------------------------------------------------
 
 logging.basicConfig(
@@ -180,12 +196,12 @@ log = logging.getLogger("yopmail-netflix")
 
 
 # =============================================================================
-#  Async retry decorator
+# Async retry decorator
 # =============================================================================
-
 def retry_on_timeout(retries: int = RETRY_COUNT, delay: float = RETRY_DELAY):
     """Decorator async: tự động retry nếu hàm raise Playwright TimeoutError."""
     retries = max(1, retries)  # guard: retries <= 0 is a silent no-op
+
     def deco(fn):
         @functools.wraps(fn)
         async def wrapper(*args, **kwargs):
@@ -211,20 +227,18 @@ def retry_on_timeout(retries: int = RETRY_COUNT, delay: float = RETRY_DELAY):
 
 
 # =============================================================================
-#  URL sanitization
+# URL sanitization
 # =============================================================================
-
 def _sanitize_url(url: str) -> str:
     """Strip nftoken param from query and fragment to prevent token leak in logs/returns."""
     return re.sub(r'([?&#])nftoken=[^&#]*', r'\1nftoken=***', url)
 
 
 # =============================================================================
-#  State file helpers (sync — không cần page)
-#  Wrapped via asyncio.to_thread for async call sites to avoid blocking
-#  the event loop on FileLock contention.
+# State file helpers (sync — không cần page)
+# Wrapped via asyncio.to_thread for async call sites to avoid blocking
+# the event loop on FileLock contention.
 # =============================================================================
-
 def _fsync_dir(dirpath: str) -> None:
     """fsync thư mục để đảm bảo metadata được flush sau os.replace."""
     try:
@@ -236,6 +250,7 @@ def _fsync_dir(dirpath: str) -> None:
     except OSError:
         pass
 
+
 def atomic_write(path: Path, content: str) -> None:
     d = os.path.dirname(os.path.abspath(str(path)))
     # Giữ mode của file cũ nếu có
@@ -244,6 +259,7 @@ def atomic_write(path: Path, content: str) -> None:
         old_mode = os.stat(str(path)).st_mode & 0o777
     except OSError:
         pass
+
     raw_fd, tmp = tempfile.mkstemp(dir=d)
     f = None
     f_closed = False
@@ -295,11 +311,14 @@ def mark_in_progress(token: str) -> bool:
                         current[key] = status
                     else:
                         current[line] = "done"  # migrate cũ
+
             if token in current and current[token] == "done":
                 return False  # đã done — bỏ qua
+
             # Nếu status là "in_progress" (stale từ process trước bị crash) → re-claim
             if token in current:
                 log.info("Token %s đang in_progress (stale) — re-claim.", token)
+
             current[token] = "in_progress"
             content = "\n".join(f"{k}\t{current[k]}" for k in sorted(current))
             atomic_write(STATE_FILE, content + "\n" if content else "")
@@ -328,6 +347,7 @@ def unmark_in_progress(token: str) -> None:
                         current[key] = status
                     else:
                         current[line] = "done"
+
             if token in current and current[token] == "in_progress":
                 del current[token]
                 content = "\n".join(
@@ -394,31 +414,33 @@ def save_processed(tokens: set[str]) -> None:
 
 
 # =============================================================================
-#  Async state wrappers — route sync state ops through asyncio.to_thread
-#  to avoid blocking the event loop on FileLock contention.
+# Async state wrappers — route sync state ops through asyncio.to_thread
+# to avoid blocking the event loop on FileLock contention.
 # =============================================================================
-
 async def _async_load_processed() -> set[str]:
     return await asyncio.to_thread(load_processed)
+
 
 async def _async_save_processed(tokens: set[str]) -> None:
     return await asyncio.to_thread(save_processed, tokens)
 
+
 async def _async_mark_in_progress(token: str) -> bool:
     return await asyncio.to_thread(mark_in_progress, token)
+
 
 async def _async_unmark_in_progress(token: str) -> None:
     return await asyncio.to_thread(unmark_in_progress, token)
 
 
 # =============================================================================
-#  Token helpers
+# Token helpers
 # =============================================================================
-
 def extract_token(url: str) -> str | None:
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
     nftoken = params.get("nftoken")
+
     # Also check fragment: handles both ?-format (#nftoken=a&b=c)
     # and hash-router format (#/verify?nftoken=a) where parse_qs
     # finds no & in the raw fragment.
@@ -428,6 +450,7 @@ def extract_token(url: str) -> str | None:
             frag = frag.split("?", 1)[1]
         params = parse_qs(frag)
         nftoken = params.get("nftoken")
+
     if nftoken:
         val = nftoken[0]
         # Reject control chars (tab/newline) that could corrupt state file format
@@ -438,19 +461,16 @@ def extract_token(url: str) -> str | None:
 
 
 # =============================================================================
-#  Gmail IMAP — đọc email Netflix từ label "Netflix-yopmail"
+# Gmail IMAP — đọc email Netflix từ label "Netflix-yopmail"
 # =============================================================================
-
 def fetch_netflix_emails() -> list[tuple[str, str]]:
     """
     Connect to Gmail IMAP, read emails from Netflix in label 'Netflix-yopmail'.
     Returns list of (email_uid, netflix_link) tuples.
-    Uses IMAP IDLE/NOT — standard IMAP read.
     """
     import email as email_lib
 
     links: list[tuple[str, str]] = []
-
     mail = imaplib.IMAP4_SSL("imap.gmail.com")
     try:
         mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
@@ -506,16 +526,18 @@ def fetch_netflix_emails() -> list[tuple[str, str]]:
 
 
 # =============================================================================
-#  Netflix page helpers
+# Netflix page helpers
 # =============================================================================
-
 # ⚠ Over-broad regex: một số name như "Update", "Continue" có thể match
 # các element không liên quan trên trang Netflix. Trong ngữ cảnh hiện tại,
 # script chỉ navigate đến Netflix verify page nên rủi ro thấp.
 # Nếu sau này mở rộng sang page khác, cân nhắc thêm aria-label/role constraints.
 # v12: thêm word-boundary anchors ^...$ để tránh partial match (e.g. "Update settings").
+# v17: chấp nhận cả "Yes, this is me" và "Yes, this was me" — README mô tả nút
+# là "was" nhưng regex cũ chỉ match "is"; giữ cả hai để không phụ thuộc vào
+# việc đoán đúng thì nào Netflix đang dùng.
 _CONFIRM_LABEL = re.compile(
-    r"^(?:Yes, this is me|Update|Confirm|Continue|Xác nhận|Tiếp tục)$",
+    r"^(?:Yes,\s*this (?:is|was) me|Update|Confirm|Continue|Xác nhận|Tiếp tục)$",
     re.IGNORECASE,
 )
 
@@ -525,13 +547,25 @@ _EXPIRED_PATTERN = re.compile(
 )
 
 
-async def confirm_netflix_page(page) -> bool:
-    """Auto-click nút xác nhận trên Netflix verify page.
-    Trả về True nếu tìm thấy, click thành công nút confirm, và URL thay đổi.
-    Trả về False nếu không tìm thấy nút hoặc URL không đổi sau click.
+def _on_verify_path(url: str) -> bool:
+    """True nếu url vẫn đang ở travel-verify / update-primary-location path."""
+    return any(marker in url for marker in VERIFY_PATH_MARKERS)
 
-    v12: filter(visible=True) before .first (hidden button edge case).
-    v12: post-click URL change check (false-positive detection).
+
+async def confirm_netflix_page(page) -> str:
+    """Auto-click nút xác nhận trên Netflix verify page.
+
+    v17: trả về status string thay vì bool, để _process_url_impl phân biệt
+    "chắc chắn xong" và "không chắc — nên retry" thay vì coi mọi trường hợp
+    không thấy nút là thành công.
+
+    Trả về:
+      "clicked"   — tìm thấy nút, click thành công, URL đổi sau click.
+      "resolved"  — không có nút, NHƯNG đã rời khỏi verify/update-location
+                    path (Netflix có thể tự xác nhận qua GET + redirect).
+      "uncertain" — không có nút VÀ vẫn còn ở verify/update-location path.
+                    KHÔNG được coi là thành công — caller không set done.
+      "no_click"  — có nút nhưng click xong URL không đổi (có thể chưa ăn).
     """
     await page.wait_for_timeout(1500)
     btn = (
@@ -540,31 +574,37 @@ async def confirm_netflix_page(page) -> bool:
         .filter(visible=True)
         .first
     )
+
     # Distinguish "no button" from "button exists but unclickable"
     try:
         await btn.wait_for(state="visible", timeout=3000)
     except PWTimeout:
-        log.info("Không tìm thấy nút confirm — có thể link đã tự xác nhận.")
-        return False
+        if _on_verify_path(page.url):
+            log.warning("Không tìm thấy nút confirm, vẫn ở verify path — uncertain.")
+            return "uncertain"
+        log.info("Không tìm thấy nút, đã rời verify path — có thể tự xác nhận qua GET.")
+        return "resolved"
+
     # Button exists past this point — failure below is NOT "already verified"
     try:
         current_url = page.url
         log.info("Tìm thấy nút confirm → click.")
         await btn.click(timeout=5000)  # bound it; don't inherit 30s default
         await page.wait_for_timeout(2000)
+
         # Verify click was processed: URL should change after confirm
         new_url = page.url
         if new_url != current_url:
             log.info("URL changed after confirm — đã xác nhận ✓")
-            return True
+            return "clicked"
         log.warning("URL unchanged after confirm click — may not be processed.")
-        return False
+        return "no_click"
     except PWTimeout:
         log.warning("Nút confirm tồn tại nhưng click thất bại (covered/detached/disabled).")
-        return False
+        return "no_click"
     except Exception as exc:
         log.warning("confirm_netflix_page — lỗi click không mong đợi: %s", exc)
-        return False
+        return "no_click"
 
 
 async def is_link_expired(page) -> bool:
@@ -582,9 +622,8 @@ async def is_link_expired(page) -> bool:
 
 
 # =============================================================================
-#  Xử lý 1 URL Netflix (chạy song song)
+# Xử lý 1 URL Netflix (chạy song song)
 # =============================================================================
-
 async def process_url(context, url: str, sem: asyncio.Semaphore | None = None) -> dict:
     """Mở 1 link Netflix trong tab riêng, confirm, check expired.
 
@@ -594,7 +633,6 @@ async def process_url(context, url: str, sem: asyncio.Semaphore | None = None) -
     use case thì không sao, nhưng cần lưu ý nếu mở rộng multi-account.
 
     Trả về dict kết quả — không ghi biến chung, tránh đụng độ.
-    v12: return dicts use _sanitize_url(url) to prevent token leak.
     """
     if sem is not None:
         async with sem:
@@ -611,32 +649,38 @@ async def _process_url_impl(context, url: str) -> dict:
         # Short-circuit: no token → nothing to do
         if token is None:
             return {"url": safe_url, "token": None, "ok": False,
-                    "clicked": bool(False),
-                    "error": "no token in URL"}
+                     "clicked": False, "error": "no token in URL"}
 
         page = await asyncio.wait_for(context.new_page(),
-                                      timeout=NAV_TIMEOUT_MS / 1000)
+                                       timeout=NAV_TIMEOUT_MS / 1000)
         page.set_default_timeout(NAV_TIMEOUT_MS)
-        log.info("Processing verification link...")
 
+        log.info("Processing verification link...")
         r = await page.goto(url, wait_until="load", timeout=NAV_TIMEOUT_MS)
         if r is None or not r.ok:
             return {"url": safe_url, "token": "***", "ok": False,
-                    "clicked": bool(False),
-                    "error": f"HTTP {r.status if r else 'none'}"}
-
+                     "clicked": False, "error": f"HTTP {r.status if r else 'none'}"}
         log.info("HTTP %d OK", r.status)
 
         if await is_link_expired(page):
             return {"url": safe_url, "token": "***", "ok": False,
-                    "clicked": bool(False),
-                    "error": "expired"}
+                     "clicked": False, "error": "expired"}
 
-        clicked = await confirm_netflix_page(page)
-        log.info("Token đã xác nhận ✓" if clicked
-                 else "Token đã xác nhận (không cần click) ✓")
-        return {"url": safe_url, "token": "***", "ok": True,
-                "clicked": bool(clicked), "error": None}
+        # v17: status-based outcome thay vì bool — chỉ "clicked"/"resolved"
+        # được coi là ok=True (thật sự xong). "uncertain"/"no_click" giữ
+        # ok=False để token KHÔNG bị mark done, và được retry ở lần poll sau.
+        status = await confirm_netflix_page(page)
+        ok = status in ("clicked", "resolved")
+        clicked = status == "clicked"
+        log.info({
+            "clicked": "Token đã xác nhận ✓",
+            "resolved": "Token đã xác nhận (không cần click, rời verify path) ✓",
+            "uncertain": "Không xác nhận được — giữ trạng thái để retry.",
+            "no_click": "Click không có tác dụng — giữ trạng thái để retry.",
+        }[status])
+
+        return {"url": safe_url, "token": "***", "ok": ok,
+                 "clicked": clicked, "error": None if ok else status}
 
     except asyncio.TimeoutError:
         # Cleanup orphaned pages from cancelled new_page()
@@ -646,13 +690,13 @@ async def _process_url_impl(context, url: str) -> dict:
             except Exception:
                 pass
         return {"url": safe_url, "token": "***", "ok": False,
-                "clicked": bool(False), "error": "new_page timeout"}
+                 "clicked": False, "error": "new_page timeout"}
     except PWTimeout:
         return {"url": safe_url, "token": "***", "ok": False,
-                "clicked": bool(False), "error": "timeout"}
+                 "clicked": False, "error": "timeout"}
     except Exception as exc:
         return {"url": safe_url, "token": "***", "ok": False,
-                "clicked": bool(False), "error": type(exc).__name__}
+                 "clicked": False, "error": type(exc).__name__}
     finally:
         if page is not None:
             try:
@@ -662,17 +706,16 @@ async def _process_url_impl(context, url: str) -> dict:
 
 
 # =============================================================================
-#  Main workflow
+# Main workflow
 # =============================================================================
-
 async def main() -> int:
     processed = await _async_load_processed()
     newly_done: set[str] = set()
-
     browser = None
     context = None
     page = None
     has_errors = False
+    check_count = 0
 
     async with async_playwright() as p:
         try:
@@ -682,17 +725,21 @@ async def main() -> int:
             raw_ua = await probe.evaluate("() => navigator.userAgent")
             await probe.close()
             ua = raw_ua.replace("HeadlessChrome", "Chrome")
+
             context = await browser.new_context(
                 user_agent=ua,
-                locale="en-US",
-                timezone_id="America/New_York",
+                locale=BROWSER_LOCALE,
+                timezone_id=BROWSER_TIMEZONE,
                 viewport={"width": 1920, "height": 1080},
                 device_scale_factor=1,
                 is_mobile=False,
                 has_touch=False,
                 color_scheme="light",
                 extra_http_headers={
-                    "Accept-Language": "en-US,en;q=0.9",
+                    # v17: derive từ BROWSER_LOCALE thay vì hardcode "en-US" —
+                    # tránh lệch giữa header HTTP và navigator.language nếu
+                    # NETFLIX_LOCALE được set khác en-US.
+                    "Accept-Language": f"{BROWSER_LOCALE},{BROWSER_LOCALE.split('-')[0]};q=0.9",
                     "Upgrade-Insecure-Requests": "1",
                 },
             )
@@ -711,7 +758,6 @@ async def main() -> int:
 
             all_links: list[str] = []
             check_count = len(raw_links)
-
             for mid, link in raw_links:
                 if link not in all_links:
                     all_links.append(link)
@@ -732,7 +778,6 @@ async def main() -> int:
                 else:
                     pending: list[tuple[str, str]] = []
                     seen: set[str] = set()
-
                     for url in all_links:
                         token = extract_token(url)
                         if token is None or token in processed or token in seen:
@@ -760,7 +805,6 @@ async def main() -> int:
                         async def _run(u):
                             # Gate the entire page lifecycle under the semaphore
                             # so we never open >MAX_CONCURRENCY tabs at once.
-                            # process_url is called without its own sem (sem=None).
                             async with sem:
                                 return await process_url(context, u)
 
@@ -771,7 +815,6 @@ async def main() -> int:
                             results = await asyncio.gather(
                                 *tasks, return_exceptions=True
                             )
-
                             for i, r in enumerate(results):
                                 token = pending[i][1]
                                 if isinstance(r, Exception):
@@ -808,7 +851,7 @@ async def main() -> int:
             return 1
         finally:
             for obj, name in [(page, "page"), (context, "context"),
-                              (browser, "browser")]:
+                               (browser, "browser")]:
                 if obj is not None:
                     try:
                         await obj.close()
@@ -818,6 +861,7 @@ async def main() -> int:
     # ── Final save (safety net) ─────────────────────────────────
     if newly_done:
         await _async_save_processed(newly_done)
+
     processed_count = len(newly_done)
     if _CI_MODE:
         import json as _json
